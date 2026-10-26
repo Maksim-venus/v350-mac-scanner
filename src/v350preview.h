@@ -1,6 +1,7 @@
 #ifndef V350PREVIEW_H
 #define V350PREVIEW_H
 #include <stdint.h>
+#include "v350film.h"
 #define PV_MAXG 64
 typedef struct {
   int dpi, width, height;
@@ -13,6 +14,7 @@ typedef struct {
   uint8_t *gaprow;                      /* per-row 1 = gap-like (no picture content), for blank detection */
   int film;                             /* PV_* film type used for detection */
   double base[3];                       /* negatives: film-base level per channel (0..1), 0 if unknown */
+  v350_finish fin;                      /* negatives: finished-positive parameters for the whole strip */
 } pv_info;
 
 /* film types: detection differs (positives: gaps are dark; negatives: gaps are clear/orange base) */
@@ -22,8 +24,8 @@ const char *pv_film_name(int film);
 
 /* img: interleaved RGB, 8 or 16 bit (LE), w x h at dpi */
 void pv_analyze(const uint8_t *img, int w, int h, int bits, int dpi, double max_seg, int film, pv_info *pi);
-/* display PNG: positives auto-levelled; negatives inverted (colour: base/orange mask removed).
-   Display only - scanned TIFFs are always raw. pi may be NULL (then base is estimated). */
+/* display PNG: positives auto-levelled; negatives through the same finishing pipeline as the
+   「输出成片」 scans (v350film). pi may be NULL (then parameters are estimated). */
 int  pv_write_png(const char *path, const uint8_t *img, int w, int h, int bits, int film, const pv_info *pi);
 int  pv_write_json(const char *path, const pv_info *pi, const char *tiff, const char *png);
 void pv_print(const pv_info *pi);

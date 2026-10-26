@@ -146,7 +146,7 @@ def zh(text):
 CONF_DIR = os.path.expanduser("~/Library/Application Support/v350scan") if sys.platform == "darwin" \
     else os.path.expanduser("~/.config/v350scan")
 CONF_FILE = os.path.join(CONF_DIR, "gui.json")
-CONF_DEFAULT = {"outdir": "", "dpi": 300, "bits": 16, "film": "cneg", "interpreter": ""}  # outdir "" = none yet
+CONF_DEFAULT = {"outdir": "", "dpi": 300, "bits": 16, "film": "cneg", "interpreter": "", "finish": True, "esc_n1": False}  # outdir "" = none yet
 FILMS = ("cneg", "bneg", "cpos", "bpos")
 
 def load_conf():
@@ -238,15 +238,22 @@ def scan_cmd(q, dry=False):
     outdir = conf_folder()                                       # the folder chosen with the picker
     if not outdir: raise ValueError("no folder chosen")
     if not os.path.isdir(outdir): raise ValueError("folder missing")
+    conf = load_conf()
+    with LOCK: pv = STATE.get("preview") or {}
+    film = pv.get("film") if pv.get("film") in FILMS else conf.get("film", "cpos")
+    neg = film in ("cneg", "bneg")
+    extra = []
+    if neg and q.get("finish", conf.get("finish", True)):      # 「输出成片」
+        if not (pv.get("json") and (pv.get("finish") or {}).get("valid")): raise ValueError("finish needs preview")
+        extra += ["--finish-from", pv["json"]]
+    if neg and conf.get("esc_n1"): extra.append("--esc-n1")    # hidden A/B switch
     if dpi == 300:
         out = os.path.join(outdir, "strip_300_%d_%s.tif" % (bits, stamp()))
-        cmd = [ARGS.bin, "--dpi", "300", "--bits", str(bits), "--progress", "--out", out] + interp_args()
+        cmd = [ARGS.bin, "--dpi", "300", "--bits", str(bits), "--progress", "--film", film, "--out", out] + extra + interp_args()
     else:
         if not only: raise ValueError("no segments")
         out = outdir                                             # straight into the folder, numbers continue
-        with LOCK: pv = STATE.get("preview") or {}
-        film = pv.get("film") if pv.get("film") in FILMS else load_conf().get("film", "cpos")
-        cmd = [ARGS.bin, "--dpi", str(dpi), "--bits", str(bits), "--progress", "--film", film,
+        cmd = [ARGS.bin, "--dpi", str(dpi), "--bits", str(bits), "--progress", "--film", film] + extra + [
                "--only", ",".join(str(n) for n in sorted(set(only))), "--outdir", outdir] + interp_args()
         if cuts: cmd += ["--cuts", ",".join("%.4f" % c for c in sorted(cuts))]
         if q.get("start") not in (None, ""): cmd += ["--start", "%.4f" % float(q["start"])]
@@ -321,6 +328,7 @@ class H(BaseHTTPRequestHandler):
             for k in ("dpi", "bits"):
                 if k in q: c[k] = int(q[k])
             if q.get("film") in FILMS: c["film"] = q["film"]
+            if isinstance(q.get("finish"), bool): c["finish"] = q["finish"]
             if "interpreter" in q: c["interpreter"] = str(q["interpreter"] or "")
             try: save_conf(c)
             except OSError as e: return self.js({"error": str(e)}, 500)
@@ -372,7 +380,8 @@ class H(BaseHTTPRequestHandler):
             c = load_conf(); c["film"] = film
             try: save_conf(c)
             except OSError: pass
-            cmd = [ARGS.bin, "--preview", "--progress", "--film", film, "--out", out] + interp_args()
+            n1 = ["--esc-n1"] if film in ("cneg", "bneg") and c.get("esc_n1") else []
+            cmd = [ARGS.bin, "--preview", "--progress", "--film", film, "--out", out] + n1 + interp_args()
             threading.Thread(target=run_job, args=("preview", cmd, out), daemon=True).start()
             return self.js({"ok": True, "out": out})
         if u.path == "/api/scan":

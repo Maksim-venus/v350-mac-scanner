@@ -58,9 +58,12 @@ v350scan looks for it at
 
 Epson's own software sends `ESC N 1` for negatives, and the scanner then uses a different exposure /
 gain calibration (more exposure, especially for the blue channel behind the orange mask). v350scan
-always scans with `ESC N 0` and saves the raw transmission data; negative inversion and mask removal
-are left to the user's software. Whether `ESC N 1` gives better shadow detail for dense negatives has
-not been tested on hardware yet.
+scans with `ESC N 0` by default and does the negative processing on the computer (「输出成片」,
+`src/v350film.c`), or saves the raw transmission data. `--esc-n1` sends `ESC N 1` for negatives
+(preview and scans alike, because the finishing parameters come from the preview) so the two can be
+compared; it has not been tested on hardware yet. With `ESC N 1` the raw levels are expected to be
+brighter (more exposure behind the orange mask), which the finishing pipeline handles because it
+measures the film base itself.
 
 ## Frame-gap detection (300 dpi preview)
 

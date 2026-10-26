@@ -23,10 +23,11 @@ struct Conf {
     static var dir: String { if let e = getenv("V350_CONF_DIR") { return expand(String(cString: e)) }; return expand("~/Library/Application Support/v350scan") }
     static var file: String { dir + "/gui.json" }
     static func load() -> [String: Any] {
-        var c: [String: Any] = ["outdir": "", "dpi": 300, "bits": 16, "film": "cneg", "interpreter": ""]
+        var c: [String: Any] = ["outdir": "", "dpi": 300, "bits": 16, "film": "cneg", "interpreter": "",
+                                "finish": true, "esc_n1": false]
         if let d = FileManager.default.contents(atPath: file),
            let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
-            for k in ["outdir", "dpi", "bits", "film", "interpreter"] { if let v = j[k] { c[k] = v } }
+            for k in ["outdir", "dpi", "bits", "film", "interpreter", "finish", "esc_n1"] { if let v = j[k] { c[k] = v } }
         }
         return c
     }
@@ -248,14 +249,25 @@ final class Engine {
         if outdir.isEmpty { throw E(description: "no folder chosen") }
         if !isDir(outdir) { throw E(description: "folder missing") }
         var cmd: [String], out: String
+        let conf = Conf.load()
+        let film = (preview?["film"] as? String).flatMap { FILMS.contains($0) ? $0 : nil } ?? ((conf["film"] as? String) ?? "cpos")
+        let neg = film == "cneg" || film == "bneg"
+        // 「输出成片」: negatives are saved as finished positives with the strip parameters of the preview
+        let wantFinish = neg && ((q["finish"] as? Bool) ?? ((conf["finish"] as? Bool) ?? true))
+        var finishArgs: [String] = []
+        if wantFinish {
+            guard let jp = preview?["json"] as? String, let f = preview?["finish"] as? [String: Any],
+                  ((f["valid"] as? NSNumber)?.intValue ?? 0) == 1 else { throw E(description: "finish needs preview") }
+            finishArgs = ["--finish-from", jp]
+        }
+        if neg && ((conf["esc_n1"] as? Bool) ?? false) { finishArgs.append("--esc-n1") }   // hidden A/B switch (gui.json)
         if dpi == 300 {
             out = outdir + "/strip_300_\(bits)_\(stamp()).tif"
-            cmd = [bin, "--dpi", "300", "--bits", "\(bits)", "--progress", "--out", out]
+            cmd = [bin, "--dpi", "300", "--bits", "\(bits)", "--progress", "--film", film, "--out", out] + finishArgs
         } else {
             if only.isEmpty { throw E(description: "no segments") }
             out = outdir
-            let film = (preview?["film"] as? String).flatMap { FILMS.contains($0) ? $0 : nil } ?? ((Conf.load()["film"] as? String) ?? "cpos")
-            cmd = [bin, "--dpi", "\(dpi)", "--bits", "\(bits)", "--progress", "--film", film,
+            cmd = [bin, "--dpi", "\(dpi)", "--bits", "\(bits)", "--progress", "--film", film] + finishArgs + [
                    "--only", only.map(String.init).joined(separator: ","), "--outdir", outdir]
             if !cuts.isEmpty { cmd += ["--cuts", cuts.map { String(format: "%.4f", $0) }.joined(separator: ",")] }
             if let s = q["start"] as? NSNumber { cmd += ["--start", String(format: "%.4f", s.doubleValue)] }
@@ -388,6 +400,7 @@ final class Handler: NSObject, WKURLSchemeHandler {
             var c = Conf.load()
             for k in ["dpi", "bits"] { if let v = q[k] as? NSNumber { c[k] = v.intValue } }
             if let f = q["film"] as? String, FILMS.contains(f) { c["film"] = f }
+            if let f = q["finish"] as? Bool { c["finish"] = f }
             Conf.save(c); js(task, c); return
         case "/api/open":
             eng.lock.lock(); var d = eng.scanDir ?? ""; eng.lock.unlock()
@@ -442,7 +455,8 @@ final class Handler: NSObject, WKURLSchemeHandler {
             let start = {
                 self.eng.dropPreview()
                 let out = self.eng.session + "/preview_\(stamp()).tif"
-                self.eng.run(kind: "preview", cmd: [self.eng.bin, "--preview", "--progress", "--film", film, "--out", out] + self.eng.interpArgs(), result: out)
+                let n1 = (film == "cneg" || film == "bneg") && ((Conf.load()["esc_n1"] as? Bool) ?? false) ? ["--esc-n1"] : []
+                self.eng.run(kind: "preview", cmd: [self.eng.bin, "--preview", "--progress", "--film", film, "--out", out] + n1 + self.eng.interpArgs(), result: out)
                 self.js(task, ["ok": true, "out": out])
             }
             if (q["pick"] as? Bool) ?? true {

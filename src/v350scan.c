@@ -74,6 +74,12 @@ static void usage(const char *a) {
     "         --dry-run            print the window plan, do not touch the scanner\n"
     "         --analyze P.tif      gap detection + PNG + JSON for an existing 300 dpi preview (no scanner)\n"
     "         --film cpos|bpos|cneg|bneg   film type for gap detection and the preview PNG\n"
+    "         --finish-from P.json  negatives: save finished positives (「输出成片」) using the strip\n"
+    "                      parameters computed from preview P (B&W -> greyscale TIFF). Default: raw\n"
+    "         --finish     same, parameters taken from --cuts-from P.json\n"
+    "         --develop RAW.tif OUT.tif --finish-from P.json [--dpi N]   finish an existing raw scan\n"
+    "         --esc-n1     EXPERIMENTAL: scan negatives in the scanner's negative mode (ESC N=1),\n"
+    "                      for A/B tests; use it for the preview too. Not hardware-tested\n"
     "                              (colour/B&W positive, colour/B&W negative; scans stay raw)\n"
     "         --interpreter PATH   Epson Interpreter 68.bundle (default: from the ICA driver)\n"
     "         --check-driver       report whether the Epson ICA driver is installed (no USB)\n"
@@ -174,6 +180,7 @@ typedef struct {
   v350_tiff_stream *keep;     /* optional raw window copy */
   uint8_t *mem; size_t mem_cap, mem_n;   /* optional in-memory copy (preview analysis) */
   int k, n, h, progress, step;
+  fin_lut *dl; uint8_t *dbuf; int dw;   /* finished output on the direct (single 300 dpi window) path */
 } tee_t;
 
 static int tee_line(void *ctx, const uint8_t *line, size_t bpl, int index) {
@@ -190,6 +197,7 @@ static int tee_line(void *ctx, const uint8_t *line, size_t bpl, int index) {
   if (t->lv) live_line(t->lv, line, index);
   if (t->sw) return segw_line(t->sw, line, index);
   if (t->st) return stitch_line(t->st, line, bpl, index);
+  if (t->dl) { fin_row(t->dl, line, t->dbuf, t->dw); return v350_tiff_write_rows(t->direct, t->dbuf, 1); }
   return v350_tiff_write_rows(t->direct, line, 1);
 }
 
@@ -207,7 +215,7 @@ static int parse_list(const char *s, double *v, int max) {
 /* minimal reader for our own preview JSON: "cuts": [..] and "end": x */
 static int read_cuts_json(const char *path, double *cuts, int max, double *end, double *start) {
   FILE *f = fopen(path, "r"); if (!f) return -1;
-  static char buf[65536]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
+  static char buf[1 << 18]; size_t n = fread(buf, 1, sizeof buf - 1, f); buf[n] = 0; fclose(f);
   char *p = strstr(buf, "\"cuts\""); if (!p || !(p = strchr(p, '['))) return -1;
   char *q = strchr(p, ']'); if (!q) return -1;
   *q = 0; int c = parse_list(p + 1, cuts, max); *q = ']';
@@ -279,6 +287,23 @@ static int cmd_analyze(const char *path) {
   return 0;
 }
 
+/* --develop IN OUT: apply the finishing pipeline to an already scanned raw TIFF (offline) */
+static int cmd_develop(const char *in, const char *out, const v350_finish *f, int dpi) {
+  int w, h, bits, spp;
+  uint8_t *img = read_own_tiff(in, &w, &h, &bits, &spp);
+  if (!img || spp != 3) { fprintf(stderr, "cannot read %s (need our own raw RGB TIFF)\n", in); free(img); return 1; }
+  fin_lut L; if (fin_lut_build(&L, f, bits)) { free(img); return 5; }
+  size_t rb = (size_t)w * 3 * (bits / 8);
+  uint8_t *o = malloc(rb);
+  v350_tiff_stream *t = v350_tiff_open(out, w, bits, f->bw ? 1 : 3, dpi);
+  int rc = (!o || !t) ? 5 : 0;
+  for (int y = 0; y < h && !rc; y++) { fin_row(&L, img + rb * y, o, w); rc = v350_tiff_write_rows(t, o, 1) ? 5 : 0; }
+  if (t) v350_tiff_close(t, NULL);
+  free(o); free(img); fin_lut_free(&L);
+  if (!rc) printf("%s\n", out);
+  return rc;
+}
+
 /* ---------------- split mode: one trimmed TIFF per segment ---------------- */
 struct segw {
   v350_tiff_stream *t;
@@ -289,7 +314,11 @@ struct segw {
   uint8_t *head; int head_n, head_need;
   uint8_t *tail; int tail_n, hold_from;
   int started, a_line, b_line, a_found, b_found;
+  int a_g0, a_g1;              /* start gap rows (window lines) when found */
+  const v350_finish *fin;      /* 「输出成片」: finishing parameters (NULL = raw) */
+  fin_lut L; int lut_ready; uint8_t *obuf;
 };
+static double G_fin_carry[3];  /* film base measured in the previous window (finished output) */
 
 static double row_level(const segw *w, const uint8_t *r) {
   int x0 = w->w / 5, x1 = w->w * 4 / 5, step = w->w / 200 > 0 ? w->w / 200 : 1; double sum = 0; int n = 0;
@@ -341,14 +370,55 @@ static int find_gap(const segw *w, const uint8_t *rows, int n, int base, int exp
   free(v);
   return res;
 }
-static int segw_put(segw *w, const uint8_t *rows, int n) { return n > 0 ? v350_tiff_write_rows(w->t, rows, n) : 0; }
+/* finished output: build the LUT once per window. The strip-wide parameters come from the
+   preview; only the film-base level is re-measured in this window's start gap (the regular scan
+   path may expose slightly differently from the 300 dpi preview path). Densities are relative to
+   the base, so the black/white points stay valid. */
+static int segw_lut(segw *w) {
+  v350_finish f = *w->fin;
+  double m[3] = {0, 0, 0}; long cnt = 0;
+  if (w->a_found && w->a_g1 - w->a_g0 >= 2 * w->edge + 2) {
+    int x0 = w->w / 5, x1 = w->w * 4 / 5, st = w->w / 200 > 0 ? w->w / 200 : 1;
+    for (int y = w->a_g0 + w->edge; y <= w->a_g1 - w->edge; y++) {
+      const uint8_t *r = w->head + (size_t)y * w->rb;
+      for (int x = x0; x < x1; x += st, cnt++) for (int c = 0; c < 3; c++) {
+        size_t i = (size_t)x * 3 + c;
+        m[c] += w->bits == 8 ? r[i] / 255.0 : (r[2 * i] | (r[2 * i + 1] << 8)) / 65535.0;
+      }
+    }
+  }
+  const char *src = "preview";
+  if (cnt > 20) {
+    int ok = 1;
+    for (int c = 0; c < 3; c++) { m[c] /= cnt; double q = m[c] / f.base[c]; if (q < 0.5 || q > 2) ok = 0; }
+    if (f.bw) { double a = (m[0] + m[1] + m[2]) / 3; m[0] = m[1] = m[2] = a; }
+    if (ok) { memcpy(G_fin_carry, m, sizeof m); src = "this window's start gap"; }
+  }
+  if (G_fin_carry[1] > 0) { memcpy(f.base, G_fin_carry, sizeof f.base); if (cnt <= 20) src = "previous window"; }
+  fprintf(stderr, "finish: %s, base %.4f %.4f %.4f (from %s)\n", f.bw ? "B&W greyscale" : "colour",
+          f.base[0], f.base[1], f.base[2], src);
+  if (fin_lut_build(&w->L, &f, w->bits)) return -1;
+  w->obuf = malloc(w->rb); if (!w->obuf) return -1;
+  w->lut_ready = 1; return 0;
+}
+static int segw_put(segw *w, const uint8_t *rows, int n) {
+  if (n <= 0) return 0;
+  if (!w->fin) return v350_tiff_write_rows(w->t, rows, n);
+  if (!w->lut_ready && segw_lut(w)) return -1;
+  for (int i = 0; i < n; i++) {
+    fin_row(&w->L, rows + (size_t)i * w->rb, w->obuf, w->w);
+    if (v350_tiff_write_rows(w->t, w->obuf, 1)) return -1;
+  }
+  return 0;
+}
+static void segw_free(segw *w) { if (w->lut_ready) fin_lut_free(&w->L); free(w->obuf); w->obuf = NULL; w->lut_ready = 0; }
 static int segw_line(segw *w, const uint8_t *line, int index) {
   if (!w->started) {                                     /* collecting head to locate the start cut */
     memcpy(w->head + (size_t)w->head_n * w->rb, line, w->rb);
     if (++w->head_n < w->head_need) return 0;
     if (w->trim_a) {
       int g0, g1, c = find_gap(w, w->head, w->head_n, 0, w->exp_a, &w->a_found, &g0, &g1);
-      w->a_ctr = c;
+      w->a_ctr = c; w->a_g0 = g0; w->a_g1 = g1;
       w->a_line = w->a_found ? g0 - w->edge : c - w->pad;   /* whole gap kept; model: safe pad */
     } else w->a_line = 0;
     if (w->a_line < 0) w->a_line = 0;
@@ -384,6 +454,10 @@ static int segw_finish(segw *w) {
 
 
 static const char *G_OUTDIR = NULL;   /* --outdir */
+static v350_finish G_FIN;             /* --finish: parameters from the preview JSON */
+static int G_FINISH = 0;
+static int G_ESCN1 = 0;               /* --esc-n1: scan negatives with the scanner's negative mode */
+static int scan_film_mode(void) { return G_ESCN1 && (g_film == PV_CNEG || g_film == PV_BNEG) ? V350_FILM_NEG : V350_FILM_POS; }
 static int G_CONT = 0;                /* --continue-numbering (implied by --outdir; kept for compatibility) */
 /* 1 + highest NN of files named frame_NN.<ext> (any ext, case-insensitive), 1 if none */
 static int next_frame_number(const char *dir) {
@@ -447,7 +521,8 @@ static int run_split(int dpi, int bits, int width, int nwin, const int *Tl, cons
     fprintf(stderr, "SEGMENT %d scanning\n", k + 1); fflush(stderr);
     if (v350_prepare_afl(&s) != 0) { fprintf(stderr, "prepare: %s\n", s.err); rc = v350_is_wedged() ? 4 : 2; fprintf(stderr, "SEGMENT %d failed\n", k + 1); break; }
     segw w; memset(&w, 0, sizeof w);
-    w.t = v350_tiff_open(path, width, bits, 3, dpi);
+    w.fin = G_FINISH ? &G_FIN : NULL;
+    w.t = v350_tiff_open(path, width, bits, w.fin && w.fin->bw ? 1 : 3, dpi);
     if (!w.t) { fprintf(stderr, "cannot create %s\n", path); rc = 5; break; }
     w.w = width; w.bits = bits; w.dpi = dpi; w.h = h; w.rb = rb;
     w.trim_a = b[k] > 0.01; w.trim_b = 1;
@@ -466,10 +541,11 @@ static int run_split(int dpi, int bits, int width, int nwin, const int *Tl, cons
       tee.keep = v350_tiff_open(kp, width, bits, 3, dpi);
     }
     int gw = 0, gh = 0; time_t ts0 = time(NULL);
-    v350_rc_t r = v350_scan_window(&s, dpi, bits, V350_COLOR_RGB, V350_FILM_POS, y, h, tee_line, &tee, &gw, &gh);
+    v350_rc_t r = v350_scan_window(&s, dpi, bits, V350_COLOR_RGB, scan_film_mode(), y, h, tee_line, &tee, &gw, &gh);
     if (tee.keep) v350_tiff_close(tee.keep, NULL);
     live_close(tee.lv); tee.lv = NULL;
     int fin = segw_finish(&w);
+    segw_free(&w);
     int H = 0; int cl = v350_tiff_close(w.t, &H);
     ord++;
     if (r != V350_OK || fin || cl || gw != width || gh != h) {
@@ -505,7 +581,7 @@ int main(int argc, char **argv) {
   int dpi = 0, bits = 16, verbose = 1, preview = 0, progress = 0, dry = 0, bits_set = 0, stitch = 0;
   int only[MAXW]; int nonly = 0; double pad_in = PAD_IN;
   const char *out = NULL, *keepdir = NULL, *cutsfrom = NULL, *livedir = NULL, *analyze = NULL;
-  int check_driver = 0;
+  int check_driver = 0; const char *finfrom = NULL, *dev_in = NULL, *dev_out = NULL;
   double cuts[MAXW]; int ncuts = 0;
   double start = -1, end = -1;
   for (int i = 1; i < argc; i++) {
@@ -546,6 +622,10 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(argv[i], "--interpreter") && i + 1 < argc) v350_set_interpreter(argv[++i]);
     else if (!strcmp(argv[i], "--check-driver")) check_driver = 1;
+    else if (!strcmp(argv[i], "--finish")) G_FINISH = 1;
+    else if (!strcmp(argv[i], "--finish-from") && i + 1 < argc) { G_FINISH = 1; finfrom = argv[++i]; }
+    else if (!strcmp(argv[i], "--esc-n1")) G_ESCN1 = 1;
+    else if (!strcmp(argv[i], "--develop") && i + 2 < argc) { dev_in = argv[i + 1]; dev_out = argv[i + 2]; i += 2; }
     else if (!strcmp(argv[i], "--experimental-eject")) return cmd_eject_experimental(verbose);
     else if (!strcmp(argv[i], "-v")) verbose++;
     else if (!strcmp(argv[i], "-q")) verbose = 0;
@@ -561,6 +641,14 @@ int main(int argc, char **argv) {
     return v350_firmware_present(b) ? 0 : 3;
   }
   if (analyze) return cmd_analyze(analyze);
+  if (dev_in) {
+    static char jb[1 << 18]; size_t jn = 0; v350_finish f;
+    FILE *jf = finfrom ? fopen(finfrom, "r") : NULL;
+    if (jf) { jn = fread(jb, 1, sizeof jb - 1, jf); fclose(jf); }
+    jb[jn] = 0;
+    if (!finfrom || fin_from_json(&f, jb)) { fprintf(stderr, "--develop needs --finish-from PREVIEW.json (negative preview)\n"); return 1; }
+    return cmd_develop(dev_in, dev_out, &f, dpi > 0 ? dpi : 300);
+  }
   if (preview) { dpi = 300; if (!bits_set) bits = 8; }
   if (!(dpi == 300 || dpi == 600 || dpi == 1200 || dpi == 2400 || dpi == 4800)) {
     fprintf(stderr, "need --preview or --dpi 300|600|1200|2400|4800 (AFL has no 3200)\n"); return 1;
@@ -573,6 +661,29 @@ int main(int argc, char **argv) {
     if (ncuts < 0) { fprintf(stderr, "cannot read cuts from %s\n", cutsfrom); return 1; }
     if (end < 0) end = e2;
   }
+  if (G_FINISH && preview) { fprintf(stderr, "note: --finish is ignored for --preview (preview is always raw; its PNG is finished)\n"); G_FINISH = 0; }
+  if (G_FINISH && !(g_film == PV_CNEG || g_film == PV_BNEG)) {
+    fprintf(stderr, "note: --finish only applies to negatives (--film cneg|bneg); saving raw\n"); G_FINISH = 0;
+  }
+  if (G_FINISH) {
+    const char *src = finfrom ? finfrom : cutsfrom;
+    static char jb[1 << 18]; size_t jn = 0;
+    FILE *jf = src ? fopen(src, "r") : NULL;
+    if (jf) { jn = fread(jb, 1, sizeof jb - 1, jf); fclose(jf); }
+    jb[jn] = 0;
+    if (!src || fin_from_json(&G_FIN, jb)) {
+      fprintf(stderr, "--finish needs the strip's preview JSON (--finish-from P.json or --cuts-from P.json) "
+                      "with a \"finish\" block (take the preview with --film cneg|bneg)\n"); return 1;
+    }
+    if ((g_film == PV_BNEG) != (G_FIN.bw != 0)) {
+      fprintf(stderr, "--finish: preview was taken with a different film type; take a new preview\n"); return 1;
+    }
+    fprintf(stderr, "finish: %s, strip parameters base %.4f %.4f %.4f  black %.3f %.3f %.3f  white %.3f %.3f %.3f D  S %.2f gamma %.2f\n",
+            G_FIN.bw ? "B&W -> greyscale" : "colour", G_FIN.base[0], G_FIN.base[1], G_FIN.base[2],
+            G_FIN.dlo[0], G_FIN.dlo[1], G_FIN.dlo[2], G_FIN.dhi[0], G_FIN.dhi[1], G_FIN.dhi[2], G_FIN.S, G_FIN.gamma);
+  }
+  if (G_ESCN1) fprintf(stderr, "note: --esc-n1 (EXPERIMENTAL, not hardware-tested): %s\n",
+                       (g_film == PV_CNEG || g_film == PV_BNEG) ? "scanning with ESC N=1 (scanner negative mode)" : "ignored for positives");
   if (start < 0) start = 0;
   double maxwin = V350_AFL_H100 / 100.0;                 /* 9.30" window-coordinate limit */
   if (end < 0) end = maxwin;
@@ -656,12 +767,18 @@ int main(int argc, char **argv) {
   struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_handler = on_sigint;
   sigaction(SIGINT, &sa, NULL); sigaction(SIGTERM, &sa, NULL);
 
-  v350_tiff_stream *ts = v350_tiff_open(out, width, bits, 3, dpi);
-  if (!ts) { fprintf(stderr, "cannot create %s\n", out); return 5; }
   v350_stitch st; int use_st = nwin > 1;
+  if (G_FINISH && use_st) { fprintf(stderr, "note: --finish is not supported with --stitch; saving raw\n"); G_FINISH = 0; }
+  fin_lut dl; uint8_t *dbuf = NULL;
+  if (G_FINISH) {
+    if (fin_lut_build(&dl, &G_FIN, bits) || !(dbuf = malloc((size_t)width * 3 * (bits / 8)))) { fprintf(stderr, "oom\n"); return 5; }
+  }
+  v350_tiff_stream *ts = v350_tiff_open(out, width, bits, G_FINISH && G_FIN.bw ? 1 : 3, dpi);
+  if (!ts) { fprintf(stderr, "cannot create %s\n", out); return 5; }
   if (use_st && stitch_init(&st, ts, width, 3, bits, dpi, nwin, ml, verbose)) { fprintf(stderr, "oom\n"); return 5; }
   tee_t tee; memset(&tee, 0, sizeof tee);
   tee.st = use_st ? &st : NULL; tee.direct = ts; tee.progress = progress; tee.n = nwin;
+  if (G_FINISH) { tee.dl = &dl; tee.dbuf = dbuf; tee.dw = width; }
   if (preview) {
     tee.mem_cap = (size_t)width * 3 * (bits / 8) * (El[0] - Tl[0]);
     tee.mem = malloc(tee.mem_cap);
@@ -708,7 +825,7 @@ int main(int argc, char **argv) {
                    tee.lv = live_open(livedir, ln, width, h, bits, dpi / 300); }
     int gw = 0, gh = 0;
     time_t ts0 = time(NULL);
-    v350_rc_t r = v350_scan_window(&s, dpi, bits, V350_COLOR_RGB, V350_FILM_POS, y, h, tee_line, &tee, &gw, &gh);
+    v350_rc_t r = v350_scan_window(&s, dpi, bits, V350_COLOR_RGB, scan_film_mode(), y, h, tee_line, &tee, &gw, &gh);
     if (tee.keep) { v350_tiff_close(tee.keep, NULL); tee.keep = NULL; }
     live_close(tee.lv); tee.lv = NULL;
     if (r != V350_OK) {

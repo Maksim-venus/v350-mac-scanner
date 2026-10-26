@@ -35,13 +35,13 @@ CFLAGS="-O2 -arch $ARCH -mmacosx-version-min=$MINOS -Wall -Wextra"
 SRC="$ROOT/src"
 echo "== CLI"
 clang $CFLAGS -I"$SRC" -I"$LIBUSB/include/libusb-1.0" -o "$BUILD/v350scan" \
-  "$SRC/v350scan.c" "$SRC/v350lib.c" "$SRC/v350tiff.c" "$SRC/v350stitch.c" "$SRC/v350preview.c" \
+  "$SRC/v350scan.c" "$SRC/v350lib.c" "$SRC/v350tiff.c" "$SRC/v350stitch.c" "$SRC/v350preview.c" "$SRC/v350film.c" \
   -L"$LIBUSB/lib" -lusb-1.0 -framework CoreFoundation -lm -lz -Wl,-rpath,@executable_path/../Frameworks
 OLD=$(otool -L "$BUILD/v350scan" | awk '/libusb/{print $1}')
 install_name_tool -change "$OLD" @rpath/libusb-1.0.0.dylib "$BUILD/v350scan"
 echo "== simulator CLI"
 clang $CFLAGS -I"$SRC" -o "$BUILD/v350scan-sim" \
-  "$SRC/v350scan.c" "$ROOT/test/mocklib.c" "$SRC/v350tiff.c" "$SRC/v350stitch.c" "$SRC/v350preview.c" -lm -lz
+  "$SRC/v350scan.c" "$ROOT/test/mocklib.c" "$SRC/v350tiff.c" "$SRC/v350stitch.c" "$SRC/v350preview.c" "$SRC/v350film.c" -lm -lz
 echo "== app"
 swiftc -O -swift-version 5 -target "$ARCH-apple-macos$MINOS" -framework AppKit -framework WebKit \
   -o "$BUILD/V350Scanner" "$ROOT/app/V350App.swift"

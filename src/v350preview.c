@@ -147,6 +147,19 @@ void pv_analyze(const uint8_t *img, int w, int h, int bits, int dpi, double max_
   pi->p90 = malloc(sizeof(float) * h); pi->np = h;
   if (pi->p90) for (int y = 0; y < h; y++) pi->p90[y] = (float)p90[y];
   pi->gaprow = gap;
+  if (neg) {      /* finishing parameters from picture rows only (no gaps/leader, away from gap edges) */
+    uint8_t *mask = calloc(h + 1, 1);
+    int pad = (int)(0.04 * dpi);
+    if (mask) {
+      for (int y = f0; y <= f1; y++) mask[y] = med[y] < NOFILM;
+      for (int y = f0; y <= f1; y++) if (gap[y])
+        for (int k = y - pad; k <= y + pad; k++) if (k >= 0 && k < h) mask[k] = 0;
+      if (fin_compute(&pi->fin, img, w, h, bits, mask, w / 5, w * 4 / 5,
+                      pi->base[1] > 0 ? pi->base : NULL, pi->film == PV_BNEG))
+        fin_compute(&pi->fin, img, w, h, bits, NULL, w / 5, w * 4 / 5, NULL, pi->film == PV_BNEG);
+      free(mask);
+    }
+  }
   free(v); free(p10); free(p90); free(med);
 }
 void pv_free(pv_info *pi) { free(pi->p90); pi->p90 = NULL; free(pi->gaprow); pi->gaprow = NULL; pi->np = 0; }
@@ -173,8 +186,9 @@ int pv_write_json(const char *path, const pv_info *pi, const char *tiff, const c
   for (int i = 0; i < pi->ncuts; i++) fprintf(f, "%s%.4f", i ? ", " : "", pi->cuts[i]);
   fprintf(f, "],\n  \"cut_kind\": [");
   for (int i = 0; i < pi->ncuts; i++) fprintf(f, "%s%d", i ? ", " : "", pi->cut_kind[i]);
-  fprintf(f, "],\n  \"film\": \"%s\", \"base\": [%.4f, %.4f, %.4f],\n  \"gaprow\": [",
-          pv_film_name(pi->film), pi->base[0], pi->base[1], pi->base[2]);
+  char fj[512]; fin_to_json(&pi->fin, fj, sizeof fj);
+  fprintf(f, "],\n  \"film\": \"%s\", \"base\": [%.4f, %.4f, %.4f],\n  \"finish\": %s,\n  \"gaprow\": [",
+          pv_film_name(pi->film), pi->base[0], pi->base[1], pi->base[2], fj);
   for (int i = 0; pi->gaprow && i < pi->np; i++) fprintf(f, "%s%d", i ? "," : "", pi->gaprow[i]);
   fprintf(f, "],\n  \"p90\": [");
   for (int i = 0; pi->p90 && i < pi->np; i++) fprintf(f, "%s%.3f", i ? "," : "", pi->p90[i]);
@@ -204,59 +218,25 @@ static int write_png_rgb8(const char *path, const uint8_t *raw, size_t raw_n, in
   return bad ? -1 : 0;
 }
 
-/* negatives, display only: t = raw / base (removes the orange mask for colour negs), density
-   d = -log10(t), then per-channel auto-levels (0.5 .. 99.5 %) over the film area. B&W: green only. */
+/* negatives: the finishing pipeline (v350film), so the preview looks like the saved 「成片」. */
 static int write_png_neg(const char *path, const uint8_t *img, int w, int h, int bits, int film, const pv_info *pi) {
-  int bw = film == PV_BNEG;
-  double base[3];
-  if (pi && pi->base[1] > 0) for (int c = 0; c < 3; c++) base[c] = pi->base[c] > 0.005 ? pi->base[c] : 0.005;
-  else {                                         /* estimate: 99th percentile per channel below NOFILM */
-    for (int c = 0; c < 3; c++) {
-      int hist[1024] = {0}; long tot = 0;
-      for (int y = 0; y < h; y += 3) for (int x = 0; x < w; x += 3) {
-        if (gv(img, w, bits, x, y) >= NOFILM) continue;
-        double q = cv(img, w, bits, x, y, c); hist[(int)(q * 1023)]++; tot++;
-      }
-      long acc = 0; base[c] = 1;
-      for (int i = 0; i < 1024; i++) { acc += hist[i]; if (acc >= tot * 0.99) { base[c] = (i + 1) / 1023.0; break; } }
-      if (base[c] < 0.005) base[c] = 0.005;
-    }
-  }
-  int f0 = 0, f1 = h - 1;
-  if (pi) { f0 = (int)(pi->film_start * pi->dpi); f1 = (int)(pi->film_end * pi->dpi); if (f1 <= f0) { f0 = 0; f1 = h - 1; } }
-  const double DMAX = 3.0;
-  double lo[3], hi[3];
-  for (int c = 0; c < 3; c++) {
-    int cc = bw ? 1 : c;
-    static int hist[4096]; memset(hist, 0, sizeof hist); long tot = 0;
-    for (int y = f0; y <= f1; y += 2) for (int x = 0; x < w; x += 2) {
-      double t = cv(img, w, bits, x, y, cc) / base[cc];
-      t = t > 1e-4 ? t : 1e-4; double d = -log10(t); if (d < 0) d = 0; if (d > DMAX) d = DMAX;
-      hist[(int)(d / DMAX * 4095)]++; tot++;
-    }
-    long acc = 0; int got = 0; lo[c] = 0; hi[c] = DMAX;
-    for (int i = 0; i < 4096; i++) {
-      acc += hist[i];
-      if (!got && acc >= tot * 0.005) { lo[c] = i / 4095.0 * DMAX; got = 1; }
-      if (acc >= tot * 0.995) { hi[c] = (i + 1) / 4095.0 * DMAX; break; }
-    }
-    if (hi[c] - lo[c] < 0.05) hi[c] = lo[c] + 0.05;
-  }
-  size_t rb = (size_t)w * 3 + 1, raw_n = rb * h;
-  uint8_t *raw = malloc(raw_n);
-  if (!raw) return -1;
+  v350_finish f;
+  if (pi && pi->fin.valid) f = pi->fin;
+  else if (fin_compute(&f, img, w, h, bits, NULL, w / 5, w * 4 / 5, NULL, film == PV_BNEG)) return -1;
+  fin_lut L; if (fin_lut_build(&L, &f, bits)) return -1;
+  size_t rb = (size_t)w * 3 + 1, raw_n = rb * h, ib = (size_t)w * 3 * (bits / 8);
+  uint8_t *raw = malloc(raw_n), *row = malloc(ib);
+  if (!raw || !row) { free(raw); free(row); fin_lut_free(&L); return -1; }
   for (int y = 0; y < h; y++) {
     uint8_t *r = raw + rb * y; r[0] = 0;
+    fin_row(&L, img + ib * y, row, w);
     for (int x = 0; x < w; x++) for (int c = 0; c < 3; c++) {
-      int cc = bw ? 1 : c;
-      double t = cv(img, w, bits, x, y, cc) / base[cc];
-      t = t > 1e-4 ? t : 1e-4; double d = -log10(t);
-      double q = (d - lo[c]) / (hi[c] - lo[c]); if (q < 0) q = 0; if (q > 1) q = 1;
-      r[1 + x * 3 + c] = (uint8_t)(q * 255 + 0.5);
+      int ci = L.chan_out == 1 ? x : x * 3 + c;
+      r[1 + x * 3 + c] = bits == 8 ? row[ci] : row[2 * ci + 1];
     }
   }
   int rc = write_png_rgb8(path, raw, raw_n, w, h);
-  free(raw); return rc;
+  free(raw); free(row); fin_lut_free(&L); return rc;
 }
 
 int pv_write_png(const char *path, const uint8_t *img, int w, int h, int bits, int film, const pv_info *pi) {
