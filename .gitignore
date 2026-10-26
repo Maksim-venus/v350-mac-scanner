@@ -1,0 +1,33 @@
+# build outputs
+/build/
+/dist/
+/.cache/
+*.o
+*.dSYM/
+test/v350scan_mock
+src/v350scan
+v350scan
+v350scan-sim
+__pycache__/
+*.pyc
+.DS_Store
+
+# never commit Epson software / firmware / reverse-engineering material
+*.bundle/
+Interpreter*
+Esfw*.bin
+esfw*.bin
+*.dmg
+ESICA*
+*.gpr
+*.rep/
+ghidra*/
+re/
+RE_*.md
+
+# scans and previews
+*.tif
+*.tiff
+*.ppm
+preview_*.json
+!test/fixtures/*.json

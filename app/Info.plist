@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>V350 Scanner</string>
+  <key>CFBundleDisplayName</key><string>V350 Scanner</string>
+  <key>CFBundleIdentifier</key><string>io.github.maksim-venus.v350scanner</string>
+  <key>CFBundleExecutable</key><string>V350Scanner</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>__VERSION__</string>
+  <key>CFBundleVersion</key><string>__VERSION__</string>
+  <key>CFBundleDevelopmentRegion</key><string>zh_CN</string>
+  <key>LSMinimumSystemVersion</key><string>__MINOS__</string>
+  <key>LSApplicationCategoryType</key><string>public.app-category.photography</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSRequiresAquaSystemAppearance</key><true/>
+  <key>NSHumanReadableCopyright</key><string>© 2026 Maksim-venus · MIT License</string>
+</dict>
+</plist>
